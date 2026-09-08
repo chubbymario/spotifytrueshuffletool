@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Playlist Shuffler</title>
+
+<!--
+  ============================================================================
+  PLAYLIST SHUFFLER
+  ============================================================================
+  A single-file web app that logs into a Spotify account, lists the user's
+  playlists, and PERMANENTLY reorders the tracks in a chosen playlist into a
+  new random order (as opposed to Spotify's built-in "Shuffle" toggle, which
+  only randomizes playback order and doesn't touch the saved playlist).
+
+  Because it's a plain HTML/CSS/JS file, it runs the same way in any modern
+  browser — Edge/Chrome on Windows 11, or Safari on an iPhone. There is no
+  installer and no build step. See README.md for setup instructions,
+  including why this file needs to be *hosted* (local server or a public
+  URL) rather than opened directly by double-clicking it.
+
+  No framework, no dependencies, no server-side code. Every request goes
+  straight from the browser to Spotify's API using the OAuth "Authorization
+  Code with PKCE" flow, which is the flow Spotify recommends for apps that
+  can't safely hide a client secret (like a script running in a browser).
+  Your Spotify credentials never touch anything but Spotify's own servers.
+  ============================================================================
+-->
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<style>
+  /* ==========================================================================
+     DESIGN TOKENS
+     A small, deliberate palette: deep charcoal, warm brass accent (a nod to
+     old turntable hardware), muted status colors. Space Grotesk carries the
+     headline personality; IBM Plex Mono is reserved for actual data — track
+     counts and the activity log — not used as decoration.
+     ========================================================================== */
+  :root {
+    --bg: #15171b;
+    --panel: #1c1f24;
+    --panel-raised: #22262c;
+    --border: #2d3138;
+    --text: #ece8e1;
+    --text-dim: #8f9298;
+    --accent: #c9952b;
+    --accent-dim: #8a6a24;
+    --accent-soft: rgba(201, 149, 43, 0.14);
+    --success: #5c9c78;
+    --error: #c1584a;
+    --radius: 10px;
+    --font-display: 'Space Grotesk', system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-display);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .card {
+    width: 100%;
+    max-width: 480px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 36px 32px 32px;
+  }
+
+  /* ---- Hero: a simple animated record. Spins only while a request is
+     actually in flight, so the motion means something ("this is working"). --- */
+  .record-wrap {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 20px;
+  }
+  .record {
+    width: 84px;
+    height: 84px;
+    border-radius: 50%;
+    background:
+      radial-gradient(circle at center, var(--accent) 0 9%, #0e0f11 9.5% 12%,
+        #1a1b1d 12.5% 20%, #0e0f11 20.5% 22%, #1a1b1d 22.5% 30%,
+        #0e0f11 30.5% 32%, #1a1b1d 32.5% 100%);
+    border: 1px solid var(--border);
+    transition: transform 0.2s ease;
+  }
+  .record.spinning {
+    animation: spin 1.1s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .record.spinning { animation: none; }
+  }
+
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    text-align: center;
+    margin: 0 0 4px;
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 14px;
+    margin: 0 0 28px;
+    line-height: 1.5;
+  }
+
+  button {
+    font-family: var(--font-display);
+    font-size: 15px;
+    font-weight: 600;
+    border: none;
+    border-radius: 8px;
+    padding: 13px 20px;
+    cursor: pointer;
+    width: 100%;
+    transition: opacity 0.15s ease, transform 0.05s ease;
+  }
+  button:active { transform: scale(0.99); }
+  button:disabled { cursor: not-allowed; opacity: 0.5; }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #17140c;
+  }
+  .btn-primary:hover:not(:disabled) { opacity: 0.92; }
+
+  .btn-secondary {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    font-weight: 500;
+    font-size: 13px;
+    padding: 8px 14px;
+    width: auto;
+  }
+  .btn-secondary:hover:not(:disabled) { color: var(--text); border-color: var(--text-dim); }
+
+  select {
+    width: 100%;
+    font-family: var(--font-display);
+    font-size: 14px;
+    color: var(--text);
+    background: var(--panel-raised);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    appearance: none;
+  }
+
+  label {
+    display: block;
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .field { margin-bottom: 18px; }
+
+  .status-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 18px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .status-row strong { color: var(--text); font-weight: 600; }
+
+  /* ---- Activity log: monospace here is functional, not decorative — it's
+     genuinely tabular status output, so fixed-width digits earn their keep. --- */
+  .log {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--text-dim);
+    background: #101215;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    height: 108px;
+    overflow-y: auto;
+    margin-top: 16px;
+    line-height: 1.6;
+  }
+  .log div.error { color: var(--error); }
+  .log div.success { color: var(--success); }
+
+  .hidden { display: none !important; }
+
+  .footer-row {
+    display: flex;
+    justify-content: center;
+    margin-top: 22px;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="record-wrap"><div class="record" id="record"></div></div>
+
+  <h1>Playlist Shuffler</h1>
+  <p class="subtitle">
+    Pick a playlist and put its tracks in a new random order — permanently,
+    not just for one listen.
+  </p>
+
+  <!-- ============ LOGGED-OUT VIEW ============ -->
+  <div id="view-login">
+    <button class="btn-primary" id="btn-login">Connect Spotify</button>
+  </div>
+
+  <!-- ============ LOGGED-IN VIEW ============ -->
+  <div id="view-app" class="hidden">
+    <div class="status-row">
+      <span>Signed in as <strong id="user-name">—</strong></span>
+    </div>
+
+    <div class="field">
+      <label for="playlist-select">Playlist</label>
+      <select id="playlist-select"></select>
+    </div>
+
+    <button class="btn-primary" id="btn-shuffle">Shuffle playlist</button>
+
+    <div class="log hidden" id="log"></div>
+
+    <div class="footer-row">
+      <button class="btn-secondary" id="btn-logout">Log out</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============================================================================
+   CONFIGURATION — edit this section for your own Spotify app
+   ============================================================================ */
+
+// Paste the Client ID from your Spotify Developer Dashboard app here.
+// This is a public identifier, not a secret — it's fine for it to live in
+// client-side code. See README.md, Step 1, for how to create the app.
+const CLIENT_ID = '083e7316708940a09bd7b115f20591e9';
+
+// Auto-detected from wherever this file is actually being served. Whatever
+// URL this resolves to MUST be added, character-for-character, to
+// "Redirect URIs" in your Spotify app settings. See README.md, Step 4.
+const REDIRECT_URI = window.location.origin + window.location.pathname;
+
+// Permissions we ask the user to grant. We only request what the tool
+// actually needs: reading playlists (to list and read them) and modifying
+// playlists (to write the new track order back).
+const SCOPES = [
+  'playlist-read-private',
+  'playlist-read-collaborative',
+  'playlist-modify-public',
+  'playlist-modify-private'
+].join(' ');
+
+/* ============================================================================
+   PKCE HELPERS
+   PKCE ("Proof Key for Code Exchange") lets a browser-only app prove to
+   Spotify that the app which starts the login and the app which finishes it
+   are the same one, without ever holding a client secret. In short:
+     1. We generate a random secret ("verifier") and keep it to ourselves.
+     2. We send Spotify a hash of it ("challenge") when starting login.
+     3. We send Spotify the original verifier when finishing login.
+     4. Spotify checks the hash matches before issuing an access token.
+   ============================================================================ */
+
+// A random string used as the PKCE verifier and as an anti-tampering "state"
+// value. crypto.getRandomValues is a cryptographically strong source of
+// randomness built into every modern browser.
+function generateRandomString(length) {
+  const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const randomValues = crypto.getRandomValues(new Uint8Array(length));
+  let text = '';
+  randomValues.forEach(v => { text += possible[v % possible.length]; });
+  return text;
+}
+
+// SHA-256 hash of a string, using the browser's built-in Web Crypto API.
+async function sha256(plain) {
+  const data = new TextEncoder().encode(plain);
+  return crypto.subtle.digest('SHA-256', data);
+}
+
+// Base64url-encode a hash (Spotify requires the URL-safe variant of base64:
+// '+' -> '-', '/' -> '_', and no trailing '=' padding).
+function base64UrlEncode(buffer) {
+  let str = '';
+  new Uint8Array(buffer).forEach(b => { str += String.fromCharCode(b); });
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function generateCodeChallenge(verifier) {
+  return base64UrlEncode(await sha256(verifier));
+}
+
+/* ============================================================================
+   AUTHENTICATION
+   ============================================================================ */
+
+// Kicks off login: builds the PKCE pair, remembers the verifier for later
+// (sessionStorage survives the full-page redirect to Spotify and back, but
+// clears when the tab closes), then sends the browser to Spotify's login
+// and consent screen.
+async function login() {
+  const verifier = generateRandomString(64);
+  const challenge = await generateCodeChallenge(verifier);
+  const state = generateRandomString(16);
+
+  sessionStorage.setItem('pkce_verifier', verifier);
+  sessionStorage.setItem('pkce_state', state);
+
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: REDIRECT_URI,
+    scope: SCOPES,
+    code_challenge_method: 'S256',
+    code_challenge: challenge,
+    state
+  });
+
+  window.location.href = `https://accounts.spotify.com/authorize?${params.toString()}`;
+}
+
+// Called once on every page load. If the URL contains the "code" and
+// "state" params Spotify adds after login, this exchanges that code for an
+// access token and cleans the URL back up. If there's no code, it's a no-op
+// (e.g. the user is just revisiting the page normally).
+async function handleRedirect() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code');
+  const state = params.get('state');
+  const authError = params.get('error');
+
+  if (authError) {
+    showError('Spotify sign-in was cancelled or denied.');
+    window.history.replaceState({}, document.title, REDIRECT_URI);
+    return;
+  }
+  if (!code) return;
+
+  const expectedState = sessionStorage.getItem('pkce_state');
+  if (!expectedState || state !== expectedState) {
+    showError('Login could not be verified (state mismatch). Please try again.');
+    window.history.replaceState({}, document.title, REDIRECT_URI);
+    return;
+  }
+
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  const body = new URLSearchParams({
+    client_id: CLIENT_ID,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: REDIRECT_URI,
+    code_verifier: verifier
+  });
+
+  const res = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
+  });
+
+  // Always scrub the code/state out of the visible URL, whether or not the
+  // exchange succeeded, so a page refresh can't try to reuse a spent code.
+  window.history.replaceState({}, document.title, REDIRECT_URI);
+
+  if (!res.ok) {
+    showError('Could not complete sign-in. Double-check CLIENT_ID and Redirect URI (see README.md).');
+    return;
+  }
+  storeTokens(await res.json());
+}
+
+// Saves the tokens Spotify issued. expires_at is stored as an absolute
+// timestamp so we can tell later whether the access token has gone stale.
+function storeTokens({ access_token, refresh_token, expires_in }) {
+  sessionStorage.setItem('access_token', access_token);
+  if (refresh_token) sessionStorage.setItem('refresh_token', refresh_token);
+  sessionStorage.setItem('expires_at', String(Date.now() + expires_in * 1000));
+}
+
+// Access tokens expire after an hour. If we have a refresh token, this
+// silently gets a new access token without asking the user to log in again.
+async function refreshAccessToken() {
+  const refresh_token = sessionStorage.getItem('refresh_token');
+  if (!refresh_token) return false;
+
+  const body = new URLSearchParams({
+    client_id: CLIENT_ID,
+    grant_type: 'refresh_token',
+    refresh_token
+  });
+
+  const res = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
+  });
+  if (!res.ok) return false;
+
+  const data = await res.json();
+  // Spotify doesn't always issue a new refresh token on refresh; keep the
+  // old one in that case.
+  storeTokens({ ...data, refresh_token: data.refresh_token || refresh_token });
+  return true;
+}
+
+// Returns a definitely-valid access token, refreshing first if the current
+// one is expired or about to expire in the next 30 seconds.
+async function getValidAccessToken() {
+  const expiresAt = Number(sessionStorage.getItem('expires_at') || 0);
+  if (Date.now() > expiresAt - 30000) {
+    const ok = await refreshAccessToken();
+    if (!ok) return null;
+  }
+  return sessionStorage.getItem('access_token');
+}
+
+function isLoggedIn() {
+  return Boolean(sessionStorage.getItem('refresh_token'));
+}
+
+function logout() {
+  sessionStorage.clear();
+  location.reload();
+}
+
+/* ============================================================================
+   SPOTIFY WEB API
+   ============================================================================ */
+
+// A thin wrapper around fetch() that: attaches the access token, retries
+// once after a silent token refresh if the token turned out to be expired
+// (401), and waits and retries if Spotify's rate limiter kicks in (429).
+async function spotifyFetch(path, options = {}) {
+  const token = await getValidAccessToken();
+  if (!token) throw new Error('Not signed in.');
+
+  const url = path.startsWith('http') ? path : `https://api.spotify.com/v1${path}`;
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    }
+  });
+
+  if (res.status === 429) {
+    const waitSeconds = Number(res.headers.get('Retry-After') || 1);
+    await new Promise(r => setTimeout(r, (waitSeconds + 0.5) * 1000));
+    return spotifyFetch(path, options);
+  }
+
+  if (res.status === 401) {
+    const refreshed = await refreshAccessToken();
+    if (refreshed) return spotifyFetch(path, options);
+    throw new Error('Your session expired. Please log in again.');
+  }
+
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody.error?.message || `Spotify API error (HTTP ${res.status})`);
+  }
+
+  return res.status === 204 ? null : res.json();
+}
+
+async function fetchCurrentUser() {
+  return spotifyFetch('/me');
+}
+
+// Playlists are returned 50 at a time; follow the "next" link Spotify gives
+// back until there isn't one, to collect the full list.
+async function fetchAllPlaylists() {
+  let items = [];
+  let url = '/me/playlists?limit=50';
+  while (url) {
+    const data = await spotifyFetch(url);
+    // Spotify occasionally includes a null entry in this list — typically a
+    // playlist you still "follow" that its owner has since deleted. There's
+    // nothing to shuffle there, so drop anything that isn't a real object.
+    items = items.concat(data.items.filter(Boolean));
+    url = data.next;
+  }
+  return items;
+}
+
+// Same pagination idea for tracks. We only ask for the fields we actually
+// need (the track's URI) to keep each response small and fast.
+async function fetchAllTrackUris(playlistId) {
+  let uris = [];
+  let url = `/playlists/${playlistId}/tracks?fields=items(track(uri))%2Cnext&limit=100`;
+  while (url) {
+    const data = await spotifyFetch(url);
+    for (const item of data.items) {
+      // A null track can happen if a song was removed from Spotify's
+      // catalog entirely; skip it since there's nothing to reorder.
+      if (item.track && item.track.uri) uris.push(item.track.uri);
+    }
+    url = data.next;
+  }
+  return uris;
+}
+
+// The Fisher–Yates shuffle: the standard algorithm for producing a random
+// permutation of a list where every ordering is equally likely.
+function shuffleArray(array) {
+  const result = array.slice();
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+
+// Writes the new order back to Spotify. The "replace playlist items" endpoint
+// only accepts up to 100 URIs per call and, importantly, REPLACES the whole
+// playlist with whatever you send — so we use it once for the first 100
+// tracks, then switch to "add items" (append) for every subsequent batch of
+// up to 100, in order. The net effect is the playlist ends up containing
+// exactly the same tracks, now in the freshly shuffled order.
+async function applyShuffledOrder(playlistId, uris, onProgress) {
+  const CHUNK_SIZE = 100;
+  const firstChunk = uris.slice(0, CHUNK_SIZE);
+
+  await spotifyFetch(`/playlists/${playlistId}/tracks`, {
+    method: 'PUT',
+    body: JSON.stringify({ uris: firstChunk })
+  });
+  onProgress(firstChunk.length, uris.length);
+
+  for (let i = CHUNK_SIZE; i < uris.length; i += CHUNK_SIZE) {
+    const chunk = uris.slice(i, i + CHUNK_SIZE);
+    await spotifyFetch(`/playlists/${playlistId}/tracks`, {
+      method: 'POST',
+      body: JSON.stringify({ uris: chunk })
+    });
+    onProgress(Math.min(i + CHUNK_SIZE, uris.length), uris.length);
+  }
+}
+
+/* ============================================================================
+   UI WIRING
+   ============================================================================ */
+
+const el = id => document.getElementById(id);
+
+function setSpinning(on) {
+  el('record').classList.toggle('spinning', on);
+}
+
+function log(message, kind) {
+  const logEl = el('log');
+  logEl.classList.remove('hidden');
+  const line = document.createElement('div');
+  if (kind) line.className = kind;
+  const time = new Date().toLocaleTimeString([], { hour12: false });
+  line.textContent = `[${time}] ${message}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function showError(message) {
+  log(message, 'error');
+}
+
+async function showLoggedInView() {
+  el('view-login').classList.add('hidden');
+  el('view-app').classList.remove('hidden');
+
+  try {
+    const me = await fetchCurrentUser();
+    el('user-name').textContent = me.display_name || me.id;
+
+    setSpinning(true);
+    const playlists = await fetchAllPlaylists();
+    setSpinning(false);
+
+    const select = el('playlist-select');
+    select.innerHTML = '';
+    for (const p of playlists) {
+      // Belt-and-suspenders: even after filtering nulls in
+      // fetchAllPlaylists(), a small number of accounts have seen Spotify
+      // return a playlist object with some fields (like `tracks`) missing.
+      // Falling back to '?' keeps one odd entry from blanking the whole list.
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      const trackCount = (p.tracks && typeof p.tracks.total === 'number') ? p.tracks.total : '?';
+      const name = p.name || '(untitled playlist)';
+      opt.textContent = `${name} (${trackCount} tracks)`;
+      select.appendChild(opt);
+    }
+    if (playlists.length === 0) {
+      const opt = document.createElement('option');
+      opt.textContent = 'No playlists found on this account';
+      select.appendChild(opt);
+      el('btn-shuffle').disabled = true;
+    }
+  } catch (err) {
+    setSpinning(false);
+    showError(err.message);
+  }
+}
+
+async function onShuffleClick() {
+  const select = el('playlist-select');
+  const playlistId = select.value;
+  const playlistName = select.options[select.selectedIndex]?.textContent || playlistId;
+  if (!playlistId) return;
+
+  el('btn-shuffle').disabled = true;
+  setSpinning(true);
+  log(`Reading tracks from "${playlistName}"...`);
+
+  try {
+    const uris = await fetchAllTrackUris(playlistId);
+    if (uris.length < 2) {
+      log('Not enough tracks to shuffle.', 'error');
+      return;
+    }
+
+    log(`Shuffling ${uris.length} tracks...`);
+    const shuffled = shuffleArray(uris);
+
+    await applyShuffledOrder(playlistId, shuffled, (done, total) => {
+      log(`Saving new order: ${done} / ${total}`);
+    });
+
+    log(`Done — "${playlistName}" is now in a new random order.`, 'success');
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    setSpinning(false);
+    el('btn-shuffle').disabled = false;
+  }
+}
+
+/* ============================================================================
+   STARTUP
+   ============================================================================ */
+
+async function init() {
+  if (CLIENT_ID === 'PASTE_YOUR_SPOTIFY_CLIENT_ID_HERE') {
+    document.querySelector('.subtitle').innerHTML =
+      'Setup needed: open <code>index.html</code> and paste your Spotify ' +
+      'Client ID into the CLIENT_ID constant. See README.md.';
+    el('btn-login').disabled = true;
+    return;
+  }
+
+  await handleRedirect();
+
+  if (isLoggedIn()) {
+    showLoggedInView();
+  } else {
+    el('view-login').classList.remove('hidden');
+  }
+}
+
+el('btn-login').addEventListener('click', login);
+el('btn-logout').addEventListener('click', logout);
+el('btn-shuffle').addEventListener('click', onShuffleClick);
+
+init();
+</script>
+</body>
+</html>
