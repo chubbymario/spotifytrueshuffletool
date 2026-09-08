@@ -25,6 +25,21 @@
   Code with PKCE" flow, which is the flow Spotify recommends for apps that
   can't safely hide a client secret (like a script running in a browser).
   Your Spotify credentials never touch anything but Spotify's own servers.
+
+  Two things worth knowing about how the shuffle itself works:
+
+  - Only playlists you own or collaborate on can be listed and shuffled.
+    Spotify's Web API (as of its February 2026 revision) returns "403
+    Forbidden" for the contents of any playlist you merely follow, so those
+    are filtered out of the dropdown rather than offered and then failing.
+
+  - Local files (tracks added from a phone or computer's own storage rather
+    than Spotify's catalog) are detected automatically. Spotify's API can
+    move a local file that's already in a playlist but can't add one fresh,
+    so a playlist containing them is shuffled with a slower, one-move-at-a-
+    time method that never removes anything — see applyShuffleViaReorder.
+    Playlists with no local files use a much faster bulk-rewrite method —
+    see applyShuffledOrderFast.
   ============================================================================
 -->
 
@@ -451,7 +466,20 @@ function logout() {
 
 /* ============================================================================
    SPOTIFY WEB API
+
+   Spotify's February 2026 Web API revision renamed the playlist-contents
+   endpoints from "/tracks" to "/items" (GET/POST/PUT/DELETE alike), and the
+   old "/tracks" paths now reject requests outright. It also tightened access:
+   reading or editing a playlist's contents now requires being its owner or
+   a collaborator — playlists you merely follow return 403 Forbidden. Every
+   call below targets the current "/items" endpoints and the code filters
+   the playlist list accordingly (see showLoggedInView).
    ============================================================================ */
+
+// Set once the user is logged in, so playlists can be checked against
+// "do I own this one?" (see showLoggedInView).
+let currentUserId = null;
+
 
 // A thin wrapper around fetch() that: attaches the access token, retries
 // once after a silent token refresh if the token turned out to be expired
@@ -484,6 +512,9 @@ async function spotifyFetch(path, options = {}) {
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
+    if (res.status === 403) {
+      throw new Error(errBody.error?.message || 'Spotify refused this action (403 Forbidden) — this usually means the playlist isn\'t one you own or collaborate on.');
+    }
     throw new Error(errBody.error?.message || `Spotify API error (HTTP ${res.status})`);
   }
 
@@ -510,21 +541,29 @@ async function fetchAllPlaylists() {
   return items;
 }
 
-// Same pagination idea for tracks. We only ask for the fields we actually
-// need (the track's URI) to keep each response small and fast.
-async function fetchAllTrackUris(playlistId) {
-  let uris = [];
-  let url = `/playlists/${playlistId}/tracks?fields=items(track(uri))%2Cnext&limit=100`;
+// Reads every item in a playlist via the current "/items" endpoint (the old
+// "/tracks" endpoint this used to call now rejects requests). We ask only
+// for the fields we need — each item's URI and whether it's a local file —
+// to keep responses small. `is_local` matters: see fetchAllTrackItems's
+// caller for why.
+async function fetchAllTrackItems(playlistId) {
+  const results = [];
+  let url = `/playlists/${playlistId}/items?` + new URLSearchParams({
+    fields: 'items(is_local,item(uri)),next',
+    limit: '100'
+  });
   while (url) {
     const data = await spotifyFetch(url);
-    for (const item of data.items) {
-      // A null track can happen if a song was removed from Spotify's
-      // catalog entirely; skip it since there's nothing to reorder.
-      if (item.track && item.track.uri) uris.push(item.track.uri);
+    for (const entry of data.items) {
+      const uri = entry.item && entry.item.uri;
+      // A missing URI can happen if a track was pulled from Spotify's
+      // catalog entirely; skip it since there's nothing left to reorder.
+      if (!uri) continue;
+      results.push({ uri, isLocal: Boolean(entry.is_local) });
     }
     url = data.next;
   }
-  return uris;
+  return results;
 }
 
 // The Fisher–Yates shuffle: the standard algorithm for producing a random
@@ -538,17 +577,24 @@ function shuffleArray(array) {
   return result;
 }
 
-// Writes the new order back to Spotify. The "replace playlist items" endpoint
-// only accepts up to 100 URIs per call and, importantly, REPLACES the whole
-// playlist with whatever you send — so we use it once for the first 100
-// tracks, then switch to "add items" (append) for every subsequent batch of
-// up to 100, in order. The net effect is the playlist ends up containing
-// exactly the same tracks, now in the freshly shuffled order.
-async function applyShuffledOrder(playlistId, uris, onProgress) {
+// Turns a shuffled list of URIs into a fast rewrite of the whole playlist.
+// The "replace playlist items" endpoint only accepts up to 100 URIs per call
+// and, importantly, REPLACES the whole playlist with whatever you send — so
+// we use it once for the first 100 tracks, then switch to "add items"
+// (append) for every subsequent batch of up to 100, in order.
+//
+// IMPORTANT: this only works when the playlist has no local files. Spotify's
+// API cannot *add* a local-file URI (only move or remove an existing one —
+// see the docs on local files), and replace/append is really "remove
+// everything, then add it all back" from the API's point of view. Using this
+// path on a playlist with local files would silently drop them. The caller
+// (onShuffleClick) checks for that and picks applyShuffleViaReorder instead
+// when any local files are present.
+async function applyShuffledOrderFast(playlistId, uris, onProgress) {
   const CHUNK_SIZE = 100;
   const firstChunk = uris.slice(0, CHUNK_SIZE);
 
-  await spotifyFetch(`/playlists/${playlistId}/tracks`, {
+  await spotifyFetch(`/playlists/${playlistId}/items`, {
     method: 'PUT',
     body: JSON.stringify({ uris: firstChunk })
   });
@@ -556,11 +602,60 @@ async function applyShuffledOrder(playlistId, uris, onProgress) {
 
   for (let i = CHUNK_SIZE; i < uris.length; i += CHUNK_SIZE) {
     const chunk = uris.slice(i, i + CHUNK_SIZE);
-    await spotifyFetch(`/playlists/${playlistId}/tracks`, {
+    await spotifyFetch(`/playlists/${playlistId}/items`, {
       method: 'POST',
       body: JSON.stringify({ uris: chunk })
     });
     onProgress(Math.min(i + CHUNK_SIZE, uris.length), uris.length);
+  }
+}
+
+// Produces a random permutation of the indices 0..n-1 (i.e. "track originally
+// at index 7 should now go first", etc.) using the same Fisher–Yates logic
+// as shuffleArray, just applied to positions instead of the URIs themselves.
+// Keeping the permutation as indices (rather than shuffling URIs directly)
+// is what lets applyShuffleViaReorder figure out which physical item to move
+// where, without caring what a "local" URI even looks like.
+function shufflePermutation(length) {
+  return shuffleArray(Array.from({ length }, (_, i) => i));
+}
+
+// Reorders a playlist's items in place — one "move this single item"
+// request per track that isn't already where it needs to be — instead of
+// replacing the playlist's contents. This is slower (up to one API call per
+// track, versus one call per 100 for applyShuffledOrderFast) but never
+// removes or re-adds anything, which is what makes it safe for playlists
+// containing local files: Spotify's API can reorder a local file that's
+// already in a playlist, it just can't be asked to (re-)add one.
+//
+// The approach is a standard in-place "selection sort": for each target
+// position i (left to right), find whichever track should end up there,
+// and — if it isn't already there — move it directly into place with one
+// reorder call. `current` tracks our own model of the playlist's order so
+// we know where to look next, without having to re-fetch after every move.
+async function applyShuffleViaReorder(playlistId, targetOrder, onProgress) {
+  const total = targetOrder.length;
+  let current = targetOrder.map((_, i) => i); // starts as the original order: [0, 1, 2, ...]
+
+  for (let i = 0; i < total - 1; i++) {
+    const wantOriginalIndex = targetOrder[i];
+    let j = i;
+    while (current[j] !== wantOriginalIndex) j++;
+
+    if (j !== i) {
+      // Move the single item at position j to position i. Since j > i here,
+      // Spotify's insert_before is simply i (see the API reference: moving
+      // an item to an EARLIER position uses that position directly, with no
+      // off-by-one — the +1 adjustment only applies when moving something
+      // later in the list, which this algorithm never needs to do).
+      await spotifyFetch(`/playlists/${playlistId}/items`, {
+        method: 'PUT',
+        body: JSON.stringify({ range_start: j, range_length: 1, insert_before: i })
+      });
+      const [moved] = current.splice(j, 1);
+      current.splice(i, 0, moved);
+    }
+    onProgress(i + 1, total);
   }
 }
 
@@ -595,29 +690,41 @@ async function showLoggedInView() {
 
   try {
     const me = await fetchCurrentUser();
+    currentUserId = me.id;
     el('user-name').textContent = me.display_name || me.id;
 
     setSpinning(true);
-    const playlists = await fetchAllPlaylists();
+    const allPlaylists = await fetchAllPlaylists();
     setSpinning(false);
+
+    // Spotify's playlist-contents endpoints now return 403 Forbidden for
+    // any playlist you merely follow rather than own or collaborate on
+    // (e.g. a friend's playlist, or an official Spotify playlist saved to
+    // your library). There's nothing this tool could do with those, so
+    // they're left out of the list rather than offered and then failing.
+    const editable = allPlaylists.filter(p => p.owner?.id === currentUserId || p.collaborative);
+    const hiddenCount = allPlaylists.length - editable.length;
 
     const select = el('playlist-select');
     select.innerHTML = '';
-    for (const p of playlists) {
-      // Belt-and-suspenders: even after filtering nulls in
-      // fetchAllPlaylists(), a small number of accounts have seen Spotify
-      // return a playlist object with some fields (like `tracks`) missing.
-      // Falling back to '?' keeps one odd entry from blanking the whole list.
+    for (const p of editable) {
       const opt = document.createElement('option');
       opt.value = p.id;
-      const trackCount = (p.tracks && typeof p.tracks.total === 'number') ? p.tracks.total : '?';
+      // Spotify's Feb 2026 revision renamed this summary field from
+      // "tracks" to "items"; both are sent for now, so prefer the new one
+      // but fall back to the old one, then to '?' if neither is present.
+      const total = p.items?.total ?? p.tracks?.total ?? '?';
       const name = p.name || '(untitled playlist)';
-      opt.textContent = `${name} (${trackCount} tracks)`;
+      opt.textContent = `${name} (${total} tracks)`;
       select.appendChild(opt);
     }
-    if (playlists.length === 0) {
+
+    if (hiddenCount > 0) {
+      log(`${hiddenCount} playlist(s) you follow but don't own or collaborate on aren't shown — Spotify only allows edits to your own or collaborative playlists.`);
+    }
+    if (editable.length === 0) {
       const opt = document.createElement('option');
-      opt.textContent = 'No playlists found on this account';
+      opt.textContent = 'No editable playlists found on this account';
       select.appendChild(opt);
       el('btn-shuffle').disabled = true;
     }
@@ -638,18 +745,35 @@ async function onShuffleClick() {
   log(`Reading tracks from "${playlistName}"...`);
 
   try {
-    const uris = await fetchAllTrackUris(playlistId);
-    if (uris.length < 2) {
+    const items = await fetchAllTrackItems(playlistId);
+    if (items.length < 2) {
       log('Not enough tracks to shuffle.', 'error');
       return;
     }
 
-    log(`Shuffling ${uris.length} tracks...`);
-    const shuffled = shuffleArray(uris);
+    const localCount = items.filter(it => it.isLocal).length;
+    const targetOrder = shufflePermutation(items.length); // e.g. [3,0,2,1,...]
 
-    await applyShuffledOrder(playlistId, shuffled, (done, total) => {
-      log(`Saving new order: ${done} / ${total}`);
-    });
+    if (localCount > 0) {
+      // Local files (added from a phone or computer's own storage rather
+      // than Spotify's catalog) can be reordered but not re-added — see
+      // fetchAllTrackItems / applyShuffledOrderFast for why. Moving items
+      // one at a time keeps them exactly where the shuffle puts them
+      // instead of silently dropping them.
+      log(`Found ${localCount} local file${localCount === 1 ? '' : 's'} in this playlist — using the slower move-by-move method so they're preserved (Spotify's API can reorder local files, but can't re-add them).`);
+      if (items.length > 250) {
+        log(`${items.length} tracks total — this method makes roughly one request per track, so it may take a little while.`);
+      }
+      await applyShuffleViaReorder(playlistId, targetOrder, (done, total) => {
+        log(`Moving tracks into place: ${done} / ${total}`);
+      });
+    } else {
+      log(`Shuffling ${items.length} tracks...`);
+      const shuffledUris = targetOrder.map(originalIndex => items[originalIndex].uri);
+      await applyShuffledOrderFast(playlistId, shuffledUris, (done, total) => {
+        log(`Saving new order: ${done} / ${total}`);
+      });
+    }
 
     log(`Done — "${playlistName}" is now in a new random order.`, 'success');
   } catch (err) {
