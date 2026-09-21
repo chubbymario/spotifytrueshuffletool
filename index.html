@@ -480,28 +480,73 @@ function logout() {
 // "do I own this one?" (see showLoggedInView).
 let currentUserId = null;
 
+// iOS Safari (and other mobile browsers) aggressively suspend a tab's
+// network activity and timers once it's in the background — switching to
+// another app, locking the phone, etc. A request already in flight at that
+// moment is simply killed, which surfaces to fetch() as a generic thrown
+// error (iOS's wording is literally "Load failed"), not a normal HTTP
+// error response. Calling this before each request means we wait for the
+// tab to be visible again *before* starting one, instead of firing it into
+// a connection iOS is about to cut.
+function waitWhileHidden() {
+  if (document.visibilityState !== 'hidden') return Promise.resolve();
+  log('Paused — this tab is in the background. Bring it back to the front to continue.');
+  return new Promise(resolve => {
+    function onChange() {
+      if (document.visibilityState === 'visible') {
+        document.removeEventListener('visibilitychange', onChange);
+        log('Resumed.');
+        resolve();
+      }
+    }
+    document.addEventListener('visibilitychange', onChange);
+  });
+}
 
-// A thin wrapper around fetch() that: attaches the access token, retries
-// once after a silent token refresh if the token turned out to be expired
-// (401), and waits and retries if Spotify's rate limiter kicks in (429).
-async function spotifyFetch(path, options = {}) {
+// A thin wrapper around fetch() that: waits out any period the tab spends
+// backgrounded (see waitWhileHidden), retries a request that failed outright
+// — as opposed to one that got an HTTP error response — a few times with a
+// growing delay (this is what recovers from a request that was already
+// in flight when the tab was backgrounded, or any other brief network
+// blip), attaches the access token, retries once after a silent token
+// refresh if the token turned out to be expired (401), and waits and
+// retries if Spotify's rate limiter kicks in (429).
+async function spotifyFetch(path, options = {}, networkAttempt = 0) {
+  await waitWhileHidden();
+
   const token = await getValidAccessToken();
   if (!token) throw new Error('Not signed in.');
 
   const url = path.startsWith('http') ? path : `https://api.spotify.com/v1${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
+
+  let res;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
+      }
+    });
+  } catch (networkErr) {
+    // fetch() throwing (rather than resolving with an error status) means
+    // the request itself never completed — most often because the tab was
+    // backgrounded mid-request, but also plain wifi/cellular hiccups.
+    const MAX_NETWORK_ATTEMPTS = 5;
+    if (networkAttempt < MAX_NETWORK_ATTEMPTS) {
+      const delayMs = Math.min(1000 * 2 ** networkAttempt, 16000);
+      log(`Connection hiccup (${networkErr.message}) — retrying in ${Math.round(delayMs / 1000)}s...`);
+      await new Promise(r => setTimeout(r, delayMs));
+      return spotifyFetch(path, options, networkAttempt + 1);
     }
-  });
+    throw new Error(`Lost the connection to Spotify and couldn't recover (${networkErr.message}). Check your connection and click Shuffle again.`);
+  }
 
   if (res.status === 429) {
     const waitSeconds = Number(res.headers.get('Retry-After') || 1);
     await new Promise(r => setTimeout(r, (waitSeconds + 0.5) * 1000));
-    return spotifyFetch(path, options);
+    return spotifyFetch(path, options, networkAttempt);
   }
 
   if (res.status === 401) {
@@ -743,6 +788,7 @@ async function onShuffleClick() {
   el('btn-shuffle').disabled = true;
   setSpinning(true);
   log(`Reading tracks from "${playlistName}"...`);
+  log('Tip: keep this tab open and in the foreground until this finishes — switching apps can pause it partway (it will pick back up automatically).');
 
   try {
     const items = await fetchAllTrackItems(playlistId);
@@ -778,6 +824,7 @@ async function onShuffleClick() {
     log(`Done — "${playlistName}" is now in a new random order.`, 'success');
   } catch (err) {
     showError(err.message);
+    log('If this stopped partway through writing the new order, click Shuffle again right away — it always picks up from the playlist\'s current state and finishes cleanly.');
   } finally {
     setSpinning(false);
     el('btn-shuffle').disabled = false;
