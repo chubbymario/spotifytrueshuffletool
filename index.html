@@ -577,13 +577,16 @@ function waitWhileHidden() {
 // blip), attaches the access token, retries once after a silent token
 // refresh if the token turned out to be expired (401), and waits and
 // retries if Spotify's rate limiter kicks in (429).
-async function spotifyFetch(path, options = {}, networkAttempt = 0) {
+// stops retrying if quota has been exceeded.
+async function spotifyFetch(path, options = {}, networkAttempt = 0, rateLimitRetryCount = 0) {
   await waitWhileHidden();
 
   const token = await getValidAccessToken();
   if (!token) throw makeSessionExpiredError();
 
   const url = path.startsWith('http') ? path : `https://api.spotify.com/v1${path}`;
+  const MAX_RETRIES = 3;
+  const MAX_WAIT_SECONDS = 300; // Cap automatic wait at 5 minutes
 
   let res;
   try {
@@ -604,15 +607,39 @@ async function spotifyFetch(path, options = {}, networkAttempt = 0) {
       const delayMs = Math.min(1000 * 2 ** networkAttempt, 16000);
       log(`Connection hiccup (${networkErr.message}) — retrying in ${Math.round(delayMs / 1000)}s...`);
       await new Promise(r => setTimeout(r, delayMs));
-      return spotifyFetch(path, options, networkAttempt + 1);
+      return spotifyFetch(path, options, networkAttempt + 1, rateLimitRetryCount);
     }
     throw new Error(`Lost the connection to Spotify and couldn't recover (${networkErr.message}). Check your connection and click Shuffle again.`);
   }
 
   if (res.status === 429) {
-    const waitSeconds = Number(res.headers.get('Retry-After') || 1);
-    await new Promise(r => setTimeout(r, (waitSeconds + 0.5) * 1000));
-    return spotifyFetch(path, options, networkAttempt);
+    if (rateLimitRetryCount >= MAX_RETRIES) {
+      throw new Error("Spotify API rate limit exceeded. Max retries reached.");
+    }
+
+    // Safely retrieve the header
+    const rawRetryHeader = res.headers.get('Retry-After') || res.headers.get('retry-after');
+
+    // If browser CORS blocks reading Retry-After, rawRetryHeader will be null/empty
+    if (!rawRetryHeader) {
+      console.error("[Spotify 429] Retry-After header unreadable or missing. Aborting to prevent rapid retry loop.");
+      throw new Error("Rate limited by Spotify, but Retry-After duration could not be read.");
+    }
+
+    const waitSeconds = parseInt(rawRetryHeader, 10);
+
+    // Guard against invalid numbers or extremely long waits
+    if (isNaN(waitSeconds) || waitSeconds > MAX_WAIT_SECONDS) {
+      throw new Error(
+        `Rate limit wait time is too long (${rawRetryHeader}s). Request aborted.`
+      );
+    }
+
+    const delayMs = (waitSeconds + 0.5) * 1000;
+    console.warn(`[Spotify 429] Rate limited. Waiting ${waitSeconds}s before retry ${rateLimitRetryCount + 1}...`);
+
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+    return spotifyFetch(path, options, 0, rateLimitRetryCount + 1);
   }
 
   if (res.status === 401) {
