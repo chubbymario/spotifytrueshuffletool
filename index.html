@@ -267,12 +267,18 @@
 
     <button class="btn-primary" id="btn-shuffle">Shuffle playlist</button>
 
-    <div class="log hidden" id="log"></div>
-
     <div class="footer-row">
       <button class="btn-secondary" id="btn-logout">Log out</button>
     </div>
   </div>
+
+  <!-- Deliberately OUTSIDE both views above: this activity/diagnostic log
+       stays visible no matter which view is showing, or whether the app is
+       mid-failure before either view has fully rendered. It previously
+       lived inside #view-app, which meant anything logged while that
+       container was hidden — including the exact failures this was meant
+       to help diagnose — was invisible even though it was being written. -->
+  <div class="log hidden" id="log"></div>
 </div>
 
 <script>
@@ -283,7 +289,7 @@
 // Paste the Client ID from your Spotify Developer Dashboard app here.
 // This is a public identifier, not a secret — it's fine for it to live in
 // client-side code. See README.md, Step 1, for how to create the app.
-const CLIENT_ID = '083e7316708940a09bd7b115f20591e9';
+const CLIENT_ID = 'PASTE_YOUR_SPOTIFY_CLIENT_ID_HERE';
 
 // Auto-detected from wherever this file is actually being served. Whatever
 // URL this resolves to MUST be added, character-for-character, to
@@ -402,11 +408,21 @@ async function handleRedirect() {
     code_verifier: verifier
   });
 
-  const res = await fetch('https://accounts.spotify.com/api/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body
-  });
+  let res;
+  try {
+    res = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+  } catch (networkErr) {
+    // A thrown (rather than HTTP-error) failure here would otherwise be an
+    // uncaught rejection — nothing downstream awaits this call inside a
+    // try/catch, so without this it would fail completely silently.
+    window.history.replaceState({}, document.title, REDIRECT_URI);
+    showError(`Could not reach Spotify to complete sign-in (${networkErr.message}). Please try connecting again.`);
+    return;
+  }
 
   // Always scrub the code/state out of the visible URL, whether or not the
   // exchange succeeded, so a page refresh can't try to reuse a spent code.
@@ -802,10 +818,12 @@ async function showLoggedInView() {
     const me = await fetchCurrentUser();
     currentUserId = me.id;
     el('user-name').textContent = me.display_name || me.id;
+    log(`Signed in as "${me.display_name || me.id}" (account id: ${me.id || 'unknown'}).`);
 
     setSpinning(true);
     const allPlaylists = await fetchAllPlaylists();
     setSpinning(false);
+    log(`Spotify returned ${allPlaylists.length} playlist(s) on this account.`);
 
     // Spotify's playlist-contents endpoints now return 403 Forbidden for
     // any playlist you merely follow rather than own or collaborate on
@@ -814,6 +832,7 @@ async function showLoggedInView() {
     // they're left out of the list rather than offered and then failing.
     const editable = allPlaylists.filter(p => p.owner?.id === currentUserId || p.collaborative);
     const hiddenCount = allPlaylists.length - editable.length;
+    log(`${editable.length} of those are editable (owned by you or collaborative).`);
 
     const select = el('playlist-select');
     select.innerHTML = '';
@@ -917,14 +936,35 @@ async function init() {
     return;
   }
 
-  await handleRedirect();
+  try {
+    await handleRedirect();
 
-  if (isLoggedIn()) {
-    showLoggedInView();
-  } else {
+    if (isLoggedIn()) {
+      showLoggedInView();
+    } else {
+      el('view-login').classList.remove('hidden');
+    }
+  } catch (err) {
+    // Belt-and-suspenders: anything that slips past the try/catches inside
+    // handleRedirect/showLoggedInView themselves still ends up visible here
+    // rather than as a silent failure with no view shown at all.
+    showError(`Startup error: ${err.message}`);
     el('view-login').classList.remove('hidden');
   }
 }
+
+// Final safety net: catches anything that isn't already handled above —
+// a bug in this script, or a promise rejection nothing awaited inside a
+// try/catch — and writes it to the on-page log instead of letting it fail
+// with no visible trace (which is what a silent browser-console-only error
+// looks like on a phone with no way to open developer tools).
+window.addEventListener('error', event => {
+  log(`Unexpected error: ${event.message}`, 'error');
+});
+window.addEventListener('unhandledrejection', event => {
+  const reason = event.reason;
+  log(`Unexpected error: ${reason && reason.message ? reason.message : String(reason)}`, 'error');
+});
 
 el('btn-login').addEventListener('click', login);
 el('btn-logout').addEventListener('click', logout);
