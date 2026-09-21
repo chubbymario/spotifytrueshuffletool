@@ -222,6 +222,14 @@
 
   .hidden { display: none !important; }
 
+  .login-note {
+    font-size: 13px;
+    color: var(--text-dim);
+    text-align: center;
+    margin: 14px 0 0;
+    line-height: 1.5;
+  }
+
   .footer-row {
     display: flex;
     justify-content: center;
@@ -243,6 +251,7 @@
   <!-- ============ LOGGED-OUT VIEW ============ -->
   <div id="view-login">
     <button class="btn-primary" id="btn-login">Connect Spotify</button>
+    <p class="login-note hidden" id="login-note"></p>
   </div>
 
   <!-- ============ LOGGED-IN VIEW ============ -->
@@ -274,7 +283,7 @@
 // Paste the Client ID from your Spotify Developer Dashboard app here.
 // This is a public identifier, not a secret — it's fine for it to live in
 // client-side code. See README.md, Step 1, for how to create the app.
-const CLIENT_ID = '083e7316708940a09bd7b115f20591e9';
+const CLIENT_ID = 'PASTE_YOUR_SPOTIFY_CLIENT_ID_HERE';
 
 // Auto-detected from wherever this file is actually being served. Whatever
 // URL this resolves to MUST be added, character-for-character, to
@@ -418,11 +427,38 @@ function storeTokens({ access_token, refresh_token, expires_in }) {
   sessionStorage.setItem('expires_at', String(Date.now() + expires_in * 1000));
 }
 
+// A marker error thrown whenever the Spotify session is conclusively no
+// longer usable (the refresh token was rejected outright) — as opposed to a
+// network error, which just means we couldn't tell right now and should
+// retry. Callers check `err.sessionExpired` to decide whether to show a
+// normal error or send the person back to the login screen (see
+// forceReauth in the UI section below).
+function makeSessionExpiredError(message) {
+  const err = new Error(message || 'Your Spotify session needs to be renewed — please log in again.');
+  err.sessionExpired = true;
+  return err;
+}
+
 // Access tokens expire after an hour. If we have a refresh token, this
 // silently gets a new access token without asking the user to log in again.
-async function refreshAccessToken() {
+//
+// Spotify's refresh tokens are single-use ("rotating"): a successful refresh
+// both renews the session AND invalidates the token that was just used,
+// replacing it with a new one in the response. That matters here because if
+// the connection drops while we're reading that response — the exact thing
+// iOS does to a backgrounded tab's in-flight requests — Spotify may have
+// already rotated the token on its end even though we never received the
+// replacement, permanently breaking the session. So this function retries
+// on a dropped connection (we genuinely don't know what happened and it's
+// worth finding out), but treats an actual rejection from Spotify (almost
+// always "invalid_grant") as final and throws immediately — retrying a
+// refresh token Spotify has already rejected can't succeed and, per
+// Spotify's own guidance, shouldn't be attempted.
+async function refreshAccessToken(networkAttempt = 0) {
   const refresh_token = sessionStorage.getItem('refresh_token');
-  if (!refresh_token) return false;
+  if (!refresh_token) throw makeSessionExpiredError();
+
+  await waitWhileHidden();
 
   const body = new URLSearchParams({
     client_id: CLIENT_ID,
@@ -430,12 +466,26 @@ async function refreshAccessToken() {
     refresh_token
   });
 
-  const res = await fetch('https://accounts.spotify.com/api/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body
-  });
-  if (!res.ok) return false;
+  let res;
+  try {
+    res = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+  } catch (networkErr) {
+    const MAX_NETWORK_ATTEMPTS = 5;
+    if (networkAttempt < MAX_NETWORK_ATTEMPTS) {
+      const delayMs = Math.min(1000 * 2 ** networkAttempt, 16000);
+      await new Promise(r => setTimeout(r, delayMs));
+      return refreshAccessToken(networkAttempt + 1);
+    }
+    throw new Error(`Lost the connection while renewing the session (${networkErr.message}). Check your connection and try again.`);
+  }
+
+  if (!res.ok) {
+    throw makeSessionExpiredError();
+  }
 
   const data = await res.json();
   // Spotify doesn't always issue a new refresh token on refresh; keep the
@@ -445,12 +495,12 @@ async function refreshAccessToken() {
 }
 
 // Returns a definitely-valid access token, refreshing first if the current
-// one is expired or about to expire in the next 30 seconds.
+// one is expired or about to expire in the next 30 seconds. Throws (rather
+// than returning null) if that refresh fails — see refreshAccessToken.
 async function getValidAccessToken() {
   const expiresAt = Number(sessionStorage.getItem('expires_at') || 0);
   if (Date.now() > expiresAt - 30000) {
-    const ok = await refreshAccessToken();
-    if (!ok) return null;
+    await refreshAccessToken();
   }
   return sessionStorage.getItem('access_token');
 }
@@ -515,7 +565,7 @@ async function spotifyFetch(path, options = {}, networkAttempt = 0) {
   await waitWhileHidden();
 
   const token = await getValidAccessToken();
-  if (!token) throw new Error('Not signed in.');
+  if (!token) throw makeSessionExpiredError();
 
   const url = path.startsWith('http') ? path : `https://api.spotify.com/v1${path}`;
 
@@ -550,9 +600,8 @@ async function spotifyFetch(path, options = {}, networkAttempt = 0) {
   }
 
   if (res.status === 401) {
-    const refreshed = await refreshAccessToken();
-    if (refreshed) return spotifyFetch(path, options);
-    throw new Error('Your session expired. Please log in again.');
+    await refreshAccessToken();
+    return spotifyFetch(path, options);
   }
 
   if (!res.ok) {
@@ -729,6 +778,22 @@ function showError(message) {
   log(message, 'error');
 }
 
+// Called whenever a request conclusively determines the Spotify session is
+// dead (see makeSessionExpiredError) rather than just temporarily
+// unreachable. Clears the stale session and sends the person back to a
+// clear "please log in again" prompt — the alternative, and the original
+// bug this fixes, is silently leaving them on an app view that looks normal
+// but can't actually load anything (an empty playlist dropdown with no
+// explanation).
+function forceReauth(message) {
+  sessionStorage.clear();
+  el('view-app').classList.add('hidden');
+  el('view-login').classList.remove('hidden');
+  const note = el('login-note');
+  note.textContent = message;
+  note.classList.remove('hidden');
+}
+
 async function showLoggedInView() {
   el('view-login').classList.add('hidden');
   el('view-app').classList.remove('hidden');
@@ -775,7 +840,11 @@ async function showLoggedInView() {
     }
   } catch (err) {
     setSpinning(false);
-    showError(err.message);
+    if (err.sessionExpired) {
+      forceReauth(err.message);
+    } else {
+      showError(err.message);
+    }
   }
 }
 
@@ -823,8 +892,12 @@ async function onShuffleClick() {
 
     log(`Done — "${playlistName}" is now in a new random order.`, 'success');
   } catch (err) {
-    showError(err.message);
-    log('If this stopped partway through writing the new order, click Shuffle again right away — it always picks up from the playlist\'s current state and finishes cleanly.');
+    if (err.sessionExpired) {
+      forceReauth(err.message);
+    } else {
+      showError(err.message);
+      log('If this stopped partway through writing the new order, click Shuffle again right away — it always picks up from the playlist\'s current state and finishes cleanly.');
+    }
   } finally {
     setSpinning(false);
     el('btn-shuffle').disabled = false;
